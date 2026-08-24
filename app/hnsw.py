@@ -174,7 +174,11 @@ class HNSWIndex:
             selected = self._select_neighbors_heuristic(vec, candidates, max_conn)
             self.neighbors.setdefault(l, {})[id] = selected
 
-            for n_id in selected:
+            # Iterate a snapshot: the undirected-edge repair below can remove
+            # from `selected` (it is the same list object as this node's own
+            # neighbor list), and mutating it mid-loop would skip a neighbor,
+            # leaving exactly the one-way edge this repair exists to prevent.
+            for n_id in list(selected):
                 nb_list = self.neighbors[l].setdefault(n_id, [])
                 if id not in nb_list:
                     nb_list.append(id)

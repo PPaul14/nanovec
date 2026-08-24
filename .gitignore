@@ -1,4 +1,38 @@
+# virtualenv
 venv/
+.venv/
+
+# python
 __pycache__/
-.pytest_cache/
 *.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+*.egg-info/
+
+# environment
+.env
+.env.*
+
+# index persistence artifacts (Week 3: snapshot + WAL)
+*.snapshot
+*.snap
+*.wal
+*.index
+*.idx
+*.bin
+data/
+snapshots/
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# assistant tooling config / saved prompts
+CLAUDE.md
+.claude/
+.cursorrules
+.github/copilot-instructions.md
+*.prompt.md
