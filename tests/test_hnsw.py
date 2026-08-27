@@ -64,4 +64,4 @@ def test_hnsw_recall_on_clustered_data():
 
     avg_recall = total_recall / len(query_ids)
     print(f"\nClustered Recall@{k}: {avg_recall:.3f}")
-    assert avg_recall >= 0.80, f"Recall too low on clustered data: {avg_recall}"
+    assert avg_recall >= 0.95, f"Recall too low on clustered data: {avg_recall}"

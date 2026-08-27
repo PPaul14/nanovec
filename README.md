@@ -172,25 +172,25 @@ CPython 3.14 on Windows. These are small-scale numbers — see the caveat below.
 
 | ef | Recall@10 | p50 (ms) | QPS |
 |----:|----:|----:|----:|
-| 10 | 1.000 | 0.958 | 894.7 |
-| 25 | 1.000 | 1.596 | 563.1 |
-| 50 | 1.000 | 2.404 | 379.1 |
-| 100 | 1.000 | 3.291 | 273.6 |
-| 200 | 1.000 | 3.934 | 246.8 |
-| 400 | 1.000 | 5.792 | 187.2 |
-| **flat (exact)** | **1.000** | **0.102** | **9159.9** |
+| 10 | 1.000 | 1.068 | 839.1 |
+| 25 | 1.000 | 1.605 | 530.9 |
+| 50 | 1.000 | 2.378 | 361.4 |
+| 100 | 1.000 | 3.306 | 267.4 |
+| 200 | 1.000 | 3.859 | 232.5 |
+| 400 | 1.000 | 4.129 | 213.8 |
+| **flat (exact)** | **1.000** | **0.127** | **7046.9** |
 
 ### Clustered (sigma = 0.05, 10 clusters × 100)
 
 | ef | Recall@10 | p50 (ms) | QPS |
 |----:|----:|----:|----:|
-| 10 | 1.000 | 0.452 | 2113.2 |
-| 25 | 1.000 | 0.499 | 1804.0 |
-| 50 | 1.000 | 0.562 | 1711.0 |
-| 100 | 1.000 | 0.652 | 1473.1 |
-| 200 | 1.000 | 1.282 | 731.0 |
-| 400 | 1.000 | 2.481 | 385.1 |
-| **flat (exact)** | **1.000** | **0.071** | **12542.0** |
+| 10 | 1.000 | 0.475 | 1694.6 |
+| 25 | 1.000 | 0.498 | 1868.7 |
+| 50 | 1.000 | 0.907 | 1133.4 |
+| 100 | 1.000 | 0.662 | 1267.7 |
+| 200 | 1.000 | 1.295 | 721.3 |
+| 400 | 1.000 | 2.520 | 339.3 |
+| **flat (exact)** | **1.000** | **0.075** | **12431.7** |
 
 ### Graph connectivity (clustered, n=1000)
 
@@ -203,7 +203,11 @@ CPython 3.14 on Windows. These are small-scale numbers — see the caveat below.
 | Asymmetric edges | 0 |
 | Duplicate edges | 0 |
 | Cross-cluster edges | 402 / 27874 (1.44%) |
-| Layer sizes | L0: 1000 nodes / 27874 edges · L1: 59 / 822 · L2: 3 / 6 |
+| Layer sizes | L0: 1000 nodes / 27874 edges · L1: 55 / 760 · L2: 5 / 20 |
+
+Layer-0 figures are deterministic across runs. Upper-layer node counts vary run
+to run because level assignment is a random draw and the benchmark does not seed
+it — only the layer-0 numbers above are stable.
 
 ### The honest caveat
 
@@ -215,19 +219,42 @@ graph traversal. The graph's asymptotic advantage (O(log n) nodes visited versus
 O(n)) does not pay for that constant factor until the scan itself becomes
 expensive.
 
-Recall@10 is 1.000 at every ef on both distributions, so these numbers also say
-nothing about the accuracy/speed tradeoff HNSW exists to provide — n=1000 is
-simply too small for approximation error to appear. The curves here are
-diagnostic, not competitive: what they confirm is that latency now scales with
-the ef budget, which is itself a fix (see below).
+**Recall@10 is 1.000 at every ef value, on both distributions.** That is not a
+result to be proud of — it means the benchmark is not measuring anything. The
+whole point of an ef parameter is to trade recall against latency, and a column
+of identical 1.000s says n=1000 is too small for approximation error to appear
+at all: the graph search is simply finding the exact answer every time. No
+tradeoff curve exists in this data.
 
-The crossover is expected in the tens of thousands of vectors. Measuring it at
-10k–1M is Week 5 — until then, treat "HNSW is faster" as unproven by this repo.
+So these tables cannot be read as "HNSW achieves 100% recall." They should be
+read as "this dataset is too easy to distinguish the two indexes on quality."
+The one thing they do establish is that latency now responds to the ef budget,
+which is itself the signature of a fixed graph (see below).
+
+The real recall/latency curve gets measured at 100k+ vectors in Week 5, which is
+also where the flat/HNSW crossover should appear. Until then, treat both "HNSW
+is faster" and "HNSW is accurate" as unproven by this repository.
 
 ## Debugging notes
 
 The most useful thing this project produced was a graph diagnostic, and the
 reason is that **recall alone did not catch either bug**.
+
+### Before / after
+
+| Metric (clustered, n=1000) | Before | After |
+|---|---:|---:|
+| Recall@10 | 0.547 | **1.000** |
+| Layer-0 nodes reachable from entry point | 100 / 1000 | **1000 / 1000** |
+| Asymmetric layer-0 edges | 11930 | **0** |
+| Connected components | many | **1** |
+
+**Root cause:** reverse-edge pruning left one-way edges. Search could enter a
+region and never leave, so it was trapped in whichever cluster it started from.
+**Fix:** maintain undirected edges on prune — if B drops A, A drops B.
+
+The full story took two passes, because the first fix was incomplete in a way
+recall could not see.
 
 ### Act 1 — recall flat at 0.547
 
@@ -243,8 +270,8 @@ construction, not tuning.
 
 So I wrote `benchmarks/connectivity.py` to test it directly: BFS from the entry
 point over layer-0 edges, count components, check edge symmetry. It reported
-**only 100 of 1000 nodes reachable** from the entry point, and **37% of layer-0
-edges asymmetric**.
+**only 100 of 1000 nodes reachable** from the entry point, and **11930 layer-0
+edges asymmetric** — about 37% of them.
 
 Root cause: when a new node A connected to neighbor B, the reverse edge B→A was
 added and then immediately pruned away — A was far, so the diversity heuristic
@@ -280,8 +307,9 @@ and never received its reverse edge. The repair for one-way edges was itself
 creating one-way edges.
 
 Fix: iterate a snapshot (`for n_id in list(selected)`). Asymmetric edges went
-2398 → 0. Layer-0 edges dropped ~3% (28776 → 27874) as the phantom half-edges
-disappeared, and mean degree settled at 27.9.
+2398 → 0, completing the 11930 → 0 progression in the table above. Layer-0 edges
+dropped ~3% (28776 → 27874) as the phantom half-edges disappeared, and mean
+degree settled at 27.9.
 
 ### What this cost and what it bought
 
@@ -304,7 +332,8 @@ structural damage right up until the scale at which they suddenly don't.
 - [ ] **Week 3** — persistence (snapshot + write-ahead log), metadata filtering,
       and wiring HNSW through the HTTP API
 - [ ] **Week 4** — IVF and Product Quantization
-- [ ] **Week 5** — benchmarking at 10k–1M vectors; locate the flat/HNSW crossover
+- [ ] **Week 5** — benchmarking at 100k+ vectors: measure the real recall/latency
+      curve across ef, and locate the flat/HNSW crossover
 - [ ] **Week 6** — Docker, architecture diagrams, documentation
 
 ## References
