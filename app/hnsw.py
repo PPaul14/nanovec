@@ -4,6 +4,11 @@ HNSW (Hierarchical Navigable Small World) index.
 Reference: Malkov & Yashunin, "Efficient and robust approximate nearest
 neighbor search using Hierarchical Navigable Small World graphs" (2016).
 
+Week 3 additions on top of the Week 2 graph:
+  - tombstone deletes (`delete`)  -- nodes stay in the graph for connectivity
+    but are excluded from results
+  - metadata filtering with two strategies (`filter_mode="pre"` / `"post"`)
+
 Design notes:
   - Multi-layer graph. Upper layers are sparse (long-range hops), layer 0
     contains every node (fine-grained precision).
@@ -18,7 +23,7 @@ Design notes:
 import heapq
 import math
 import random
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -36,6 +41,11 @@ class HNSWIndex:
         self.metadata: Dict[str, dict] = {}
         self.levels: Dict[str, int] = {}
         self.neighbors: Dict[int, Dict[str, List[str]]] = {}
+
+        # Tombstones. Deleted ids stay in `data` and in the graph so that
+        # traversal through them still works -- physically removing a node
+        # would tear holes in the connectivity we worked so hard to fix.
+        self.deleted: Set[str] = set()
 
         self.entry_point: Optional[str] = None
         self.max_level: int = -1
@@ -58,7 +68,12 @@ class HNSWIndex:
     # ------------------------------------------------------------------ #
 
     def _search_layer(
-        self, query: np.ndarray, entry_points: List[str], ef: int, layer: int
+        self,
+        query: np.ndarray,
+        entry_points: List[str],
+        ef: int,
+        layer: int,
+        allowed: Optional[Set[str]] = None,
     ) -> List[Tuple[float, str]]:
         """Best-first greedy walk over one layer.
 
@@ -67,21 +82,31 @@ class HNSWIndex:
                                        WORST of the current best ef, which is
                                        what we compare against to decide whether
                                        a newly seen node is worth keeping.
+
+        `allowed` implements IN-GRAPH (pre-)filtering. Crucially, traversal
+        still walks through disallowed nodes -- they just never enter the result
+        set. Refusing to traverse them would disconnect the graph and reproduce
+        exactly the fragmentation bug fixed in Week 2.
         """
         visited = set(entry_points)
         candidates: List[Tuple[float, str]] = []
         result: List[Tuple[float, str]] = []
 
+        def admissible(node: str) -> bool:
+            return allowed is None or node in allowed
+
         for ep in entry_points:
             d = self._distance(query, self.data[ep])
             heapq.heappush(candidates, (d, ep))
-            heapq.heappush(result, (-d, ep))
+            if admissible(ep):
+                heapq.heappush(result, (-d, ep))
 
         while candidates:
             dist_c, c = heapq.heappop(candidates)
-            furthest_dist = -result[0][0]
-            # Nothing left that could improve the result set -> stop early.
-            if dist_c > furthest_dist and len(result) >= ef:
+            # Only stop early once the result set is actually full. Under a
+            # selective filter it may stay under ef for a long time, and we
+            # must keep exploring rather than bail out.
+            if result and len(result) >= ef and dist_c > -result[0][0]:
                 break
 
             for neighbor in self.neighbors.get(layer, {}).get(c, []):
@@ -89,9 +114,13 @@ class HNSWIndex:
                     continue
                 visited.add(neighbor)
                 d = self._distance(query, self.data[neighbor])
-                furthest_dist = -result[0][0]
-                if len(result) < ef or d < furthest_dist:
-                    heapq.heappush(candidates, (d, neighbor))
+
+                worth_exploring = (not result) or len(result) < ef or d < -result[0][0]
+                if not worth_exploring:
+                    continue
+
+                heapq.heappush(candidates, (d, neighbor))
+                if admissible(neighbor):
                     heapq.heappush(result, (-d, neighbor))
                     if len(result) > ef:
                         heapq.heappop(result)
@@ -144,6 +173,19 @@ class HNSWIndex:
 
     def insert(self, id: str, vector: List[float], metadata: Optional[dict] = None):
         vec = np.array(vector, dtype=np.float32)
+        if vec.shape[0] != self.dim:
+            raise ValueError(f"Expected dim {self.dim}, got {vec.shape[0]}")
+
+        # Re-inserting a tombstoned id resurrects it in place.
+        if id in self.deleted:
+            self.deleted.discard(id)
+            self.data[id] = vec
+            self.metadata[id] = metadata or {}
+            return
+
+        if id in self.data:
+            raise ValueError(f"id '{id}' already exists")
+
         self.data[id] = vec
         self.metadata[id] = metadata or {}
 
@@ -172,12 +214,8 @@ class HNSWIndex:
 
             max_conn = self.M0 if l == 0 else self.M
             selected = self._select_neighbors_heuristic(vec, candidates, max_conn)
-            self.neighbors.setdefault(l, {})[id] = selected
+            self.neighbors.setdefault(l, {})[id] = list(selected)
 
-            # Iterate a snapshot: the undirected-edge repair below can remove
-            # from `selected` (it is the same list object as this node's own
-            # neighbor list), and mutating it mid-loop would skip a neighbor,
-            # leaving exactly the one-way edge this repair exists to prevent.
             for n_id in list(selected):
                 nb_list = self.neighbors[l].setdefault(n_id, [])
                 if id not in nb_list:
@@ -208,25 +246,95 @@ class HNSWIndex:
             self.entry_point = id
 
     # ------------------------------------------------------------------ #
+    # delete (tombstone)
+    # ------------------------------------------------------------------ #
+
+    def delete(self, id: str) -> None:
+        """Soft delete.
+
+        The node stays in the graph so traversal through it still works; it is
+        only filtered out of results. Hard deletion would require repairing
+        every neighbour list that pointed at it and risks fragmenting the graph
+        -- that is a compaction problem, deferred to a later phase.
+        """
+        if id not in self.data:
+            raise KeyError(f"id '{id}' not found")
+        self.deleted.add(id)
+
+    @property
+    def live_count(self) -> int:
+        return len(self.data) - len(self.deleted)
+
+    # ------------------------------------------------------------------ #
+    # metadata filtering
+    # ------------------------------------------------------------------ #
+
+    def _matching_ids(self, filter: Optional[dict]) -> Set[str]:
+        """Ids whose metadata matches every key/value in `filter`, minus tombstones.
+
+        This is a full scan -- O(N) per query. Real systems keep an inverted
+        index (value -> set of ids) to make this sublinear. Noted as a known
+        cost rather than hidden.
+        """
+        out = set()
+        for vid, meta in self.metadata.items():
+            if vid in self.deleted:
+                continue
+            if filter and any(meta.get(k) != v for k, v in filter.items()):
+                continue
+            out.add(vid)
+        return out
+
+    # ------------------------------------------------------------------ #
     # search
     # ------------------------------------------------------------------ #
 
     def search(
-        self, query: List[float], k: int = 5, ef: Optional[int] = None
+        self,
+        query: List[float],
+        k: int = 5,
+        ef: Optional[int] = None,
+        filter: Optional[dict] = None,
+        filter_mode: str = "pre",
     ) -> List[Tuple[str, float]]:
+        """Approximate k-NN search.
+
+        filter_mode="pre"  -> filter is applied DURING traversal. Slower per
+                              query, but reliably returns k results even when
+                              the filter is highly selective.
+        filter_mode="post" -> search normally, then drop non-matching results.
+                              Cheaper, but if few of the true nearest neighbours
+                              match the filter you get back fewer than k (or
+                              nothing at all). This is the classic ANN filtering
+                              trade-off.
+        """
         if self.entry_point is None:
             return []
+        if filter_mode not in ("pre", "post"):
+            raise ValueError("filter_mode must be 'pre' or 'post'")
+
         ef = ef or max(k, self.ef_construction // 2)
         vec = np.array(query, dtype=np.float32)
 
-        # Greedy descent through the sparse upper layers...
+        # Greedy descent through the sparse upper layers. Deliberately
+        # unfiltered: descent is only choosing where to start, and constraining
+        # it would land us in a worse neighbourhood.
         ep = self.entry_point
         for l in range(self.max_level, 0, -1):
             nearest = self._search_layer(vec, [ep], ef=1, layer=l)
             ep = nearest[0][1]
 
-        # ...then a wide, precise search at layer 0.
-        candidates = self._search_layer(vec, [ep], ef=ef, layer=0)
-        candidates.sort(key=lambda x: x[0])
+        if filter_mode == "pre":
+            allowed = self._matching_ids(filter)
+            if not allowed:
+                return []
+            candidates = self._search_layer(vec, [ep], ef=ef, layer=0, allowed=allowed)
+        else:
+            # Oversample so post-filtering has something left to return.
+            wide_ef = max(ef, k * 10)
+            candidates = self._search_layer(vec, [ep], ef=wide_ef, layer=0)
+            allowed = self._matching_ids(filter)
+            candidates = [c for c in candidates if c[1] in allowed]
 
+        candidates.sort(key=lambda x: x[0])
         return [(id_, self._to_score(dist)) for dist, id_ in candidates[:k]]

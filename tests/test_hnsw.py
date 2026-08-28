@@ -65,3 +65,45 @@ def test_hnsw_recall_on_clustered_data():
     avg_recall = total_recall / len(query_ids)
     print(f"\nClustered Recall@{k}: {avg_recall:.3f}")
     assert avg_recall >= 0.95, f"Recall too low on clustered data: {avg_recall}"
+
+
+def test_layer0_edges_are_symmetric():
+    """Every layer-0 edge A->B must have a matching B->A.
+
+    HNSW edges are undirected. Pruning can drop a neighbour on one side only,
+    which leaves a one-way edge and lets search get trapped in the region it
+    started from. That damage is invisible to the recall tests above: at this
+    scale the graph stays dense enough to return correct results despite
+    thousands of broken edges, so recall stays at 1.000 while the structure
+    rots. This asserts the invariant directly.
+    """
+    random.seed(7)
+    np.random.seed(7)
+    dim = 32
+    n_clusters, per_cluster = 10, 50
+
+    hnsw = HNSWIndex(dim=dim, metric="cosine")
+    centers = np.random.uniform(-1, 1, (n_clusters, dim))
+    for ci, center in enumerate(centers):
+        for j in range(per_cluster):
+            vec = (center + np.random.normal(0, 0.05, dim)).tolist()
+            hnsw.insert(f"c{ci}_v{j}", vec)
+
+    layer0 = hnsw.neighbors.get(0, {})
+    total_edges = sum(len(nbs) for nbs in layer0.values())
+
+    # Guard against a vacuous pass: an empty graph has no asymmetric edges.
+    assert total_edges > 0, "layer 0 has no edges - the index did not build"
+
+    asymmetric = [
+        (node, nb)
+        for node, nbs in layer0.items()
+        for nb in nbs
+        if node not in layer0.get(nb, [])
+    ]
+
+    print(f"\nLayer-0 edges: {total_edges}, asymmetric: {len(asymmetric)}")
+    assert not asymmetric, (
+        f"{len(asymmetric)} of {total_edges} layer-0 edges are one-way; "
+        f"first 5: {asymmetric[:5]}"
+    )
