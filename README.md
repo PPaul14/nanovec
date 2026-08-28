@@ -1,9 +1,14 @@
 # nanovec
 
-A persistent, filterable vector database built from scratch in Python: an HNSW
-graph index with metadata filtering and tombstone deletes, a write-ahead log and
-snapshot durability layer, and a brute-force exact index kept alongside as
-ground truth — all behind a FastAPI service.
+A persistent, filterable vector database built from scratch in Python: two
+independent approximate indexes — an HNSW graph and an IVF + Product
+Quantization index — plus metadata filtering, tombstone deletes, a write-ahead
+log and snapshot durability layer, and a brute-force exact index kept alongside
+as ground truth, all behind a FastAPI service.
+
+The two approximate indexes are deliberate: HNSW trades build time for query
+speed at full precision, IVF+PQ trades accuracy for a 32× smaller footprint.
+They fail for different reasons, which is the point of implementing both.
 
 ## Why
 
@@ -26,6 +31,12 @@ like this is not the code — it's the diagnostics. See
   wide `ef` search at layer 0, neighbour selection via the paper's diversity
   heuristic with `keepPrunedConnections` top-up, and undirected edge maintenance
   during pruning.
+- **`IVFPQIndex`** (`app/ivfpq.py`) — inverted file index with product
+  quantization: k-means++ coarse quantizer partitioning the space into `nlist`
+  Voronoi cells, residual product quantization (`m` subspaces, one 256-entry
+  codebook each), and asymmetric distance computation via per-cell `m × 256`
+  lookup tables. Supports metadata filtering and tombstone deletes, and reports
+  its own memory accounting split into per-vector and fixed costs.
 - **Metadata filtering** — `pre` (filter during traversal) and `post` (filter
   after search), exposing the real filtered-ANN trade-off.
 - **Tombstone deletes** — deleted nodes stay in the graph so traversal through
@@ -37,10 +48,11 @@ like this is not the code — it's the diagnostics. See
   exact-vs-approximate comparison over identical data.
 - **FastAPI service** (`app/main.py`) — five endpoints, HNSW as the default
   query backend, index recovered from disk on startup via lifespan.
-- **26 tests** covering recall against the flat baseline, graph edge symmetry,
-  filtering semantics, delete behaviour, and persistence including torn-record
-  and idempotent-replay cases.
-- **Diagnostics** — an ef/recall/latency sweep and a graph connectivity checker.
+- **43 tests** covering recall against the flat baseline, graph edge symmetry,
+  filtering semantics, delete behaviour, persistence including torn-record and
+  idempotent-replay cases, and IVF+PQ recall, compression and memory accounting.
+- **Diagnostics** — an ef/recall/latency sweep, a graph connectivity checker, a
+  three-way index comparison, and a PQ compression/recall trade-off sweep.
 
 ## Architecture
 
@@ -96,7 +108,7 @@ layer 0 with the caller's `ef` budget and return the top `k`.
 ## Quickstart
 
 ```bash
-git clone https://github.com/<your-username>/nanovec.git
+git clone https://github.com/PPaul14/nanovec.git
 cd nanovec
 
 python -m venv venv
@@ -113,8 +125,10 @@ Run the tests and diagnostics:
 
 ```bash
 venv/Scripts/python.exe -m pytest tests/ -v
-venv/Scripts/python.exe -m benchmarks.ef_curve
-venv/Scripts/python.exe -m benchmarks.connectivity
+venv/Scripts/python.exe -m benchmarks.ef_curve          # HNSW recall vs ef
+venv/Scripts/python.exe -m benchmarks.connectivity      # HNSW graph health
+venv/Scripts/python.exe -m benchmarks.compare_indexes   # Flat vs HNSW vs IVF+PQ
+venv/Scripts/python.exe -m benchmarks.pq_tradeoff       # PQ recall vs compression
 ```
 
 State persists to `data/` (`vectors.npy`, `manifest.json`, `wal.jsonl`).
@@ -335,6 +349,68 @@ search. Real systems maintain an inverted index (value → set of ids) to make
 this sublinear. This is a known cost, not an oversight. Its impact is **not yet
 measured** — neither benchmark exercises filtering.
 
+## IVF + Product Quantization
+
+HNSW attacks **time**: it avoids scanning all N vectors, but still stores every
+vector at full precision. At 1M × 128-dim that is ~512 MB of raw float32 before
+a single edge. IVF+PQ attacks **memory** instead, and the two techniques are
+composed.
+
+### IVF — scan fewer vectors
+
+k-means partitions the space into `nlist` Voronoi cells. Every vector is
+assigned to its nearest centroid and stored in that cell's inverted list. A
+query computes its distance to the `nlist` centroids, then scans only the
+`nprobe` nearest cells rather than all N vectors.
+
+The coarse quantizer is trained with **k-means++** seeding. Uniform random
+seeding lets two centroids land in the same cluster, and Lloyd's iterations
+cannot recover — no centroid can cross the empty space between well-separated
+clusters, so one ends up stranded midway between two real ones. Sampling each
+new centroid with probability proportional to D(x)², the squared distance to the
+nearest already-chosen centroid, biases selection toward whatever region is
+currently covered worst.
+
+### PQ — store each vector in m bytes
+
+Split each `dim`-dimensional vector into `m` sub-vectors of length `dim/m`. Each
+subspace gets its own 256-entry codebook, learned by k-means over that slice, so
+a sub-vector is replaced by a single byte naming its nearest codebook entry. A
+64-dim float32 vector — 256 bytes — becomes `m=8` bytes, a 32× reduction.
+
+### Residual encoding
+
+PQ encodes `vector - centroid`, not the vector itself. Residuals are far more
+tightly distributed than raw vectors, so a fixed 256-entry codebook describes
+them much more accurately. This is most of the gap between plain PQ and IVFADC,
+and it is why the lookup tables have to be rebuilt per probed cell — the
+residual is relative to *that* cell's centroid.
+
+### Asymmetric Distance Computation
+
+At query time the query is **never quantized**. For each subspace, precompute
+the distance from the query's sub-vector to all 256 codebook entries, giving an
+`m × 256` table. The distance to any stored vector is then `m` table lookups and
+a sum — no decompression, no full-precision arithmetic.
+
+Keeping one side exact is where "asymmetric" comes from, and it is measurably
+more accurate than quantizing both sides, since it avoids adding the query's own
+quantization error to every comparison.
+
+### Why both indexes exist here
+
+| | HNSW | IVF+PQ |
+|---|---|---|
+| Optimises | Query time | Memory |
+| Storage | Full precision + graph | `m` bytes per vector |
+| Loses recall by | Not visiting every node | Storing lossy reconstructions |
+| Needs training | No | **Yes** — codebooks must be fitted first |
+
+The two approximations are different in kind. HNSW can in principle reach recall
+1.000 with a large enough `ef`, because the vectors it compares are exact; PQ
+cannot, at any `nprobe`, because the information was discarded at encode time.
+Their failure modes do not overlap, which is the whole reason to build both.
+
 ## Benchmarks
 
 Measured on n=1000, dim=32, cosine, `M=16`, `M0=32`, `ef_construction=200`,
@@ -381,6 +457,70 @@ CPython 3.14 on Windows. No filtering in these runs.
 Layer-0 figures are deterministic across runs. Upper-layer node counts vary
 because level assignment is a random draw the benchmark does not seed — only the
 layer-0 numbers are stable.
+
+### Three-way comparison: Flat vs HNSW vs IVF+PQ
+
+n=2000, dim=64, 20 clusters (sigma=0.06), 30 queries, k=10, cosine. IVF+PQ at
+`nlist=32`, `m=8`. Recall@10 against `FlatIndex` as ground truth.
+
+| Index | Recall@10 | p50 (ms) | Build (s) | Memory (KB) | Per-vector compression |
+|---|---:|---:|---:|---:|---:|
+| Flat (exact) | 1.000 | 0.733 | 0.03 | 500.0 | — |
+| HNSW (ef=25) | 1.000 | 3.060 | 81.33 | 950.5 | — |
+| HNSW (ef=100) | 1.000 | 4.175 | 81.33 | 950.5 | — |
+| IVF+PQ (nprobe=1) | 0.613 | 0.823 | 6.01 | 87.6 | 32× |
+| IVF+PQ (nprobe=4) | 0.627 | 2.467 | 6.01 | 87.6 | 32× |
+| IVF+PQ (nprobe=16) | 0.627 | 9.221 | 6.01 | 87.6 | 32× |
+
+IVF+PQ memory breaks down as 15.6 KB of codes (8 bytes/vector), 64.0 KB of
+codebooks and 8.0 KB of coarse centroids. **Fixed costs dominate at this N** —
+codebooks alone are 73% of the total. That share falls toward zero as N grows,
+which is why the per-vector ratio is reported separately from the headline
+number: folding a constant into a single ratio would flatter the result at 1k
+and understate it at 1M.
+
+### What limits IVF+PQ recall
+
+This is the most interesting Week 4 result, and it is not the one the table
+suggests at a glance.
+
+**Recall is identical from nprobe=4 through nprobe=32.** `nlist=32`, so
+`nprobe=32` probes *every* cell — no vector is skipped for coverage reasons at
+all — and recall still sits at 0.627. Scanning more of the index buys nothing.
+
+So the ceiling is not cell coverage. It is PQ quantization error. Sweeping `m`
+while holding everything else fixed confirms it (`benchmarks/pq_tradeoff.py`):
+
+| m | subvector dim | compression | nprobe=1 | nprobe=32 (all cells) |
+|---:|---:|---:|---:|---:|
+| 4 | 16d | 64× | 0.497 | 0.507 |
+| 8 | 8d | 32× | 0.613 | 0.627 |
+| 16 | 4d | 16× | 0.757 | 0.793 |
+| 32 | 2d | 8× | 0.893 | 0.957 |
+
+Read down the columns: recall climbs steadily with `m`. Read across the rows:
+probing every cell instead of one adds between 0.010 and 0.064. The subspace
+count dominates; the probe count barely registers.
+
+**The curve is the result, not any single row.** Raising `m` to 32 buys recall
+0.957 — but at 8× compression instead of 32×, which discards most of the reason
+to choose IVF+PQ over HNSW in the first place. There is no setting here that is
+simply "better"; there is a frontier, and picking a point on it is an
+application decision about how much memory a percentage of recall is worth.
+
+**These numbers are provisional.** The codebooks are under-trained at this
+scale: 2000 training vectors across 8 subspaces against 256 centroids each is
+roughly **8 training points per centroid**. FAISS wants orders of magnitude more
+for `ksub=256`. Expect all of these recall figures to improve at the Week 5
+scale-up, and treat the shape of the curve as more trustworthy than its absolute
+height.
+
+**On k-means++:** switching the coarse quantizer from random to k-means++
+seeding measurably improved it — visible at `nprobe=1`, where better-spread
+cells mean the single nearest cell captures more true neighbours. It did **not**
+move the headline number, and that is consistent rather than contradictory: the
+coarse quantizer stops mattering above `nprobe=4`, so an improvement to it has
+nowhere to show up once enough cells are being probed.
 
 ### The honest caveat
 
@@ -512,8 +652,19 @@ Stated plainly rather than discovered later.
   no negation.
 - **The flat index is derived state.** Only HNSW is snapshotted; `FlatIndex` is
   rebuilt from it on boot. Cheap, but it means the two can only ever agree.
-- **Benchmarks are n=1000**, which is too small to demonstrate the properties
-  HNSW exists for. See the caveat above.
+- **IVF+PQ is not wired into the API.** It requires a training step before it
+  will accept a single write — the codebooks *are* the compression, and they
+  have to be fitted to the data distribution first. HNSW accepts writes from
+  empty. There is no training endpoint, so IVF+PQ is reachable only through the
+  tests and benchmarks, not over HTTP.
+- **IVF+PQ supports only `nbits=8`** (256-entry codebooks). Other codebook sizes
+  are rejected at construction.
+- **PQ codebooks are under-trained at benchmark scale** — roughly 8 training
+  points per centroid. Recall figures for IVF+PQ are provisional until Week 5.
+- **Neither IVF+PQ nor its state is persisted.** The WAL and snapshot layer
+  covers HNSW only.
+- **Benchmarks are n=1000 and n=2000**, too small to demonstrate the properties
+  either approximate index exists for. See the caveats above.
 
 ## Roadmap
 
@@ -522,10 +673,16 @@ Stated plainly rather than discovered later.
       against the flat baseline, ef sweep and connectivity diagnostics
 - [x] **Week 3** — persistence (snapshot + WAL), metadata filtering with pre/post
       modes, tombstone deletes, HNSW wired through the API as the default backend
-- [ ] **Week 4** — IVF and Product Quantization
+- [x] **Week 4** — IVF + Product Quantization: k-means++ coarse quantizer,
+      residual encoding, ADC lookup tables, three-way index comparison, and the
+      PQ compression/recall trade-off sweep
 - [ ] **Week 5** — benchmarking at 100k+ vectors: measure the real recall/latency
       curve across ef, and locate the flat/HNSW crossover
 - [ ] **Week 6** — Docker, architecture diagrams, documentation
+
+## License
+
+MIT — see [LICENSE](LICENSE). Copyright (c) 2026 Priyanshi Paul.
 
 ## References
 
