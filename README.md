@@ -1,79 +1,97 @@
 # nanovec
 
-A vector database built from scratch in Python — flat (exact) search and a
-hand-written HNSW graph index, behind a FastAPI service.
+A persistent, filterable vector database built from scratch in Python: an HNSW
+graph index with metadata filtering and tombstone deletes, a write-ahead log and
+snapshot durability layer, and a brute-force exact index kept alongside as
+ground truth — all behind a FastAPI service.
 
 ## Why
 
 I wanted to understand what FAISS, Milvus and Pinecone are actually doing, so
 this implements the internals rather than calling a library. Everything here is
-written from the papers: the HNSW layer structure, the Algorithm 4 diversity
-heuristic for neighbor selection, and the undirected-edge maintenance that keeps
-the graph navigable. A brute-force index runs alongside as the correctness
-ground truth, and recall of the approximate index is measured against it rather
-than assumed.
+written from the papers and from first principles: the HNSW layer structure, the
+Algorithm 4 diversity heuristic, the undirected-edge maintenance that keeps the
+graph navigable, and the WAL-before-apply ordering that makes an acknowledged
+write survive a crash.
 
-The interesting output of a project like this is not the code — it's the
-diagnostics. See [Debugging notes](#debugging-notes).
+The exact index runs in parallel with the approximate one, so recall is measured
+against ground truth rather than assumed. The interesting output of a project
+like this is not the code — it's the diagnostics. See
+[Engineering notes](#engineering-notes).
 
 ## Current capabilities
 
-- **`FlatIndex`** — brute-force exact search, cosine and L2, NumPy-vectorized.
-  Serves as the ground truth for recall measurement.
-- **`HNSWIndex`** — multi-layer navigable small world graph built from scratch:
-  - skip-list style exponential level assignment
-  - greedy descent through sparse upper layers, wide `ef` search at layer 0
-  - neighbor selection via the paper's diversity heuristic (Algorithm 4), with
-    `keepPrunedConnections` top-up
-  - undirected edge maintenance during pruning
-- **FastAPI service** — `/insert`, `/search`, `/delete/{id}`, `/stats`.
-- **Test suite** — recall validation of HNSW against `FlatIndex` on both uniform
-  and clustered data.
-- **Diagnostics** — an ef/recall/latency sweep and a graph connectivity checker
-  (BFS reachability, component count, edge symmetry, degree distribution,
-  cross-cluster edge count).
-
-Known gap: the HTTP API is currently wired only to `FlatIndex`. `HNSWIndex` is
-exercised through the tests and benchmarks, not yet through the service.
+- **`HNSWIndex`** (`app/hnsw.py`) — multi-layer navigable small world graph:
+  skip-list style level assignment, greedy descent through sparse upper layers,
+  wide `ef` search at layer 0, neighbour selection via the paper's diversity
+  heuristic with `keepPrunedConnections` top-up, and undirected edge maintenance
+  during pruning.
+- **Metadata filtering** — `pre` (filter during traversal) and `post` (filter
+  after search), exposing the real filtered-ANN trade-off.
+- **Tombstone deletes** — deleted nodes stay in the graph so traversal through
+  them still works.
+- **Durability** (`app/persistence.py`) — fsync'd write-ahead log, atomic
+  snapshots, and recovery by snapshot load plus WAL replay.
+- **`FlatIndex`** (`app/index.py`) — brute-force exact search, cosine and L2,
+  NumPy-vectorized. The correctness ground truth, and reachable at runtime for
+  exact-vs-approximate comparison over identical data.
+- **FastAPI service** (`app/main.py`) — five endpoints, HNSW as the default
+  query backend, index recovered from disk on startup via lifespan.
+- **26 tests** covering recall against the flat baseline, graph edge symmetry,
+  filtering semantics, delete behaviour, and persistence including torn-record
+  and idempotent-replay cases.
+- **Diagnostics** — an ef/recall/latency sweep and a graph connectivity checker.
 
 ## Architecture
 
 ```mermaid
 flowchart TB
-    client[Client] -->|HTTP + JSON| api
+    client["Client"]
 
-    subgraph service["FastAPI service (app/main.py)"]
-        api["POST /insert · POST /search<br/>DELETE /delete/:id · GET /stats"]
-        val["Pydantic schemas<br/>app/models.py"]
-        api --> val
+    subgraph api["FastAPI service — app/main.py"]
+        ep["POST /insert · POST /search · DELETE /delete/:id<br/>POST /snapshot · GET /stats"]
+        schemas["Pydantic schemas<br/>app/models.py"]
+        ep --> schemas
     end
 
-    val --> flat
+    subgraph durability["Durability — app/persistence.py"]
+        wal["Write-ahead log<br/>wal.jsonl · append + fsync"]
+        snap["Snapshot<br/>vectors.npy + manifest.json<br/>write .tmp then os.replace"]
+    end
 
     subgraph indexes["Index layer"]
-        flat["FlatIndex — app/index.py<br/>exact · cosine + L2<br/>NumPy vectorized"]
-        hnsw["HNSWIndex — app/hnsw.py<br/>approximate · graph traversal"]
+        router{"backend?"}
+        hnsw["HNSWIndex — approximate<br/>graph traversal · filtering · tombstones"]
+        flat["FlatIndex — exact<br/>NumPy vectorized scan"]
     end
 
-    flat -. "ground truth for recall" .-> hnsw
-    hnsw -. "not yet exposed via the API" .-> api
-
-    subgraph graph["HNSW layer structure"]
-        direction TB
-        l2["layer 2 — sparse<br/>long-range hops · entry point"]
-        l1["layer 1 — sparse"]
-        l0["layer 0 — every node<br/>M0 = 32 · fine-grained"]
-        l2 -->|"greedy descent, ef=1"| l1
-        l1 -->|"greedy descent, ef=1"| l0
-        l0 -->|"wide search, ef budget"| res["top-k"]
+    subgraph recovery["Startup recovery — lifespan"]
+        load["load snapshot"]
+        replay["replay WAL records<br/>written after it"]
+        ready["index ready"]
     end
 
-    hnsw --> graph
+    client -->|"HTTP + JSON"| ep
+    schemas -->|"writes"| wal
+    schemas -->|"queries"| router
+    wal -->|"logged first, then applied"| router
+    router -->|"hnsw (default)"| hnsw
+    router -->|"flat"| flat
+    hnsw -->|"POST /snapshot<br/>or clean shutdown"| snap
+
+    load --> replay --> ready
+    snap -.->|"on boot"| load
+    wal -.->|"on boot"| replay
+    ready -.-> hnsw
 ```
 
-Search path through HNSW: enter at the top layer, greedily walk to the closest
-node at each level with `ef=1`, then run a wide best-first search at layer 0
-with the caller's `ef` budget and return the top `k`.
+**Write path:** the request is validated, appended to the WAL and fsync'd, and
+only then applied to the in-memory index. **Recovery path:** load the latest
+snapshot, then replay the WAL records that came after it.
+
+**Search path through HNSW:** enter at the top layer, greedily walk to the
+closest node at each level with `ef=1`, then run a wide best-first search at
+layer 0 with the caller's `ef` budget and return the top `k`.
 
 ## Quickstart
 
@@ -94,103 +112,258 @@ Interactive API docs: <http://127.0.0.1:8000/docs>
 Run the tests and diagnostics:
 
 ```bash
-venv/Scripts/python.exe -m pytest tests/ -v -s
+venv/Scripts/python.exe -m pytest tests/ -v
 venv/Scripts/python.exe -m benchmarks.ef_curve
 venv/Scripts/python.exe -m benchmarks.connectivity
 ```
 
+State persists to `data/` (`vectors.npy`, `manifest.json`, `wal.jsonl`).
+
 ## API reference
 
-The service is configured for `DIM = 128`; vectors are abbreviated below.
+The service is configured for `DIM = 128`; vectors are abbreviated in the
+examples below.
 
 ### `POST /insert`
-
-Request:
 
 ```json
 {
   "id": "doc_1",
   "vector": [0.12, -0.44, 0.98],
-  "metadata": { "source": "wiki", "lang": "en" }
+  "metadata": { "category": "shoes", "in_stock": true }
 }
 ```
 
-Response:
-
 ```json
-{ "status": "ok", "id": "doc_1" }
+{ "status": "ok", "id": "doc_1", "detail": null }
 ```
 
-Returns `400` if the dimension does not match or the id already exists.
+`400` if the vector dimension is not 128. `409` if the id already exists and is
+not tombstoned. The record is written to the WAL and fsync'd before it is
+applied in memory.
 
 ### `POST /search`
 
-Request — `k` defaults to `5`, `metric` to `"cosine"` (`"l2"` also supported):
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `vector` | `float[128]` | required | Query vector |
+| `k` | `int ≥ 1` | `5` | Number of results |
+| `metric` | `string` | `"cosine"` | `"cosine"` or `"l2"` (flat backend) |
+| `backend` | `"hnsw"` \| `"flat"` | `"hnsw"` | Approximate graph search, or exact scan |
+| `ef` | `int ≥ 1` \| `null` | `null` | HNSW search breadth; `null` uses the index default |
+| `filter` | `object` \| `null` | `null` | Exact-match metadata filter, conjunctive across keys |
+| `filter_mode` | `"pre"` \| `"post"` | `"pre"` | Filter during traversal, or after search |
 
 ```json
-{ "vector": [0.10, -0.40, 0.95], "k": 3, "metric": "cosine" }
+{
+  "vector": [0.10, -0.40, 0.95],
+  "k": 3,
+  "backend": "hnsw",
+  "ef": 100,
+  "filter": { "category": "shoes", "in_stock": true },
+  "filter_mode": "pre"
+}
 ```
-
-Response:
 
 ```json
 [
-  { "id": "doc_1", "score": 0.9812, "metadata": { "source": "wiki", "lang": "en" } },
-  { "id": "doc_7", "score": 0.9433, "metadata": { "source": "wiki", "lang": "en" } },
-  { "id": "doc_3", "score": 0.9120, "metadata": null }
+  { "id": "doc_1", "score": 0.9812, "metadata": { "category": "shoes", "in_stock": true } },
+  { "id": "doc_7", "score": 0.9433, "metadata": { "category": "shoes", "in_stock": true } },
+  { "id": "doc_3", "score": 0.9120, "metadata": { "category": "shoes", "in_stock": true } }
 ]
 ```
 
 `score` is cosine similarity for `cosine` (higher is closer) and L2 distance for
-`l2` (lower is closer).
+`l2` (lower is closer). Tombstoned ids never appear. With `filter_mode: "post"`
+the array may contain fewer than `k` entries — see [Filtering](#filtering).
 
 ### `DELETE /delete/{id}`
 
-Response:
-
 ```json
-{ "status": "ok", "id": "doc_1" }
+{ "status": "ok", "id": "doc_1", "detail": null }
 ```
 
-Returns `404` if the id is not present.
+`404` if the id is unknown or already tombstoned. This is a soft delete: the
+node remains in the graph as a traversal waypoint and is excluded from results.
+
+### `POST /snapshot`
+
+```json
+{ "status": "ok", "id": null, "detail": "snapshot written to data" }
+```
+
+Writes a full point-in-time snapshot, then truncates the WAL. The snapshot is
+made durable *before* the log is dropped.
 
 ### `GET /stats`
 
-Response:
-
 ```json
-{ "count": 42, "dim": 128 }
+{
+  "live_vectors": 42,
+  "tombstoned": 3,
+  "dim": 128,
+  "max_level": 2,
+  "entry_point": "doc_17",
+  "wal_bytes": 10432
+}
 ```
+
+## Durability
+
+The index lives entirely in RAM, and rebuilding the graph from scratch is
+expensive — every insert runs a full `ef_construction` search. So state is made
+durable two ways, the same shape as Postgres checkpoints + WAL or Redis RDB +
+AOF.
+
+### Write-ahead log
+
+Every mutation is appended to `data/wal.jsonl` and **fsync'd before it is
+applied in memory**. The ordering is the entire guarantee. Apply-then-log would
+leave a window where the client has been told the write succeeded but a crash
+erases it; log-then-apply means the worst case is a logged record that was never
+applied, which replay fixes.
+
+The fsync matters as much as the ordering. Without it the write sits in the OS
+page cache and a power loss silently drops it — that would be a write-behind log
+that usually works, not a WAL.
+
+### Snapshots
+
+`save_snapshot` dumps the whole index: vectors as `vectors.npy` (float32 binary,
+roughly 5× smaller than JSON and free of decimal round-tripping), and the graph,
+metadata, levels and tombstones as `manifest.json` (human-readable, which makes
+debugging connectivity far easier).
+
+Both files are written to `.tmp` and then `os.replace`d, which is atomic on
+POSIX and Windows. **A crash mid-write leaves the previous snapshot intact**
+rather than a half-written unusable one.
+
+### Recovery
+
+On startup, `recover()` loads the latest snapshot and replays the WAL records
+written after it. Two properties make this safe:
+
+- **Replay is idempotent.** A snapshot may already contain a record the WAL also
+  holds, so applying it twice must be harmless.
+- **A torn final record stops replay cleanly.** A crash mid-append leaves an
+  incomplete last line; that record never completed, so the client was never told
+  it succeeded, and halting there is the correct behaviour rather than a
+  corruption.
+
+### Reproducing the crash test manually
+
+Both tests below use a hard kill. **Do not use Ctrl+C** — a graceful shutdown
+runs the lifespan handler, which takes a snapshot and truncates the WAL, and
+that would defeat the second test entirely.
+
+**Test 1 — snapshot survives a crash.**
+
+```bash
+uvicorn app.main:app                       # terminal 1
+
+# terminal 2
+curl -X POST localhost:8000/insert -H "Content-Type: application/json" \
+     -d '{"id":"survivor","vector":[0.1, ... 128 floats]}'
+curl -X POST localhost:8000/snapshot
+
+# hard-kill the server (Windows; get the PID from netstat -ano | findstr :8000)
+taskkill /F /PID <pid>
+#   macOS / Linux: kill -9 <pid>
+
+uvicorn app.main:app                       # restart
+curl localhost:8000/stats                  # live_vectors includes "survivor"
+```
+
+**Test 2 — WAL replay recovers an unsnapshotted write.**
+
+```bash
+uvicorn app.main:app
+
+curl -X POST localhost:8000/insert -H "Content-Type: application/json" \
+     -d '{"id":"unsnapshotted","vector":[0.1, ... 128 floats]}'
+# NO /snapshot call this time
+
+taskkill /F /PID <pid>                     # hard kill again
+
+uvicorn app.main:app
+curl localhost:8000/stats                  # live_vectors still counts it
+```
+
+In test 2 the vector exists only in `data/wal.jsonl` at kill time. Recovery
+replays it on top of whatever snapshot was on disk. The equivalent paths are
+covered automatically by `tests/test_persistence.py`, including the torn-record
+and idempotency cases.
+
+## Filtering
+
+Filtered ANN search has a genuine trade-off, and both sides of it are
+implemented rather than one being picked silently.
+
+**`filter_mode: "pre"`** applies the filter *during* graph traversal: a
+non-matching node never enters the result set. It reliably returns `k` results
+even under a highly selective filter, and costs more per query.
+
+**`filter_mode: "post"`** searches normally, then drops non-matching results. It
+is cheaper, but it can return fewer than `k` — or nothing at all.
+
+The failure mode is concrete. Ask for the top 5 `"in_stock": true` items when
+none of the 50 nearest neighbours are in stock: post-filtering searches, gets 50
+out-of-stock neighbours, filters them all away, and returns an empty list even
+though matching vectors exist further out. Pre-filtering keeps exploring until
+it has 5 matches. (`post` oversamples to `max(ef, k * 10)` to make this less
+likely, which shrinks the window without closing it.)
+
+### Traversal must pass through non-matching nodes
+
+The important implementation detail: under pre-filtering, the search still walks
+*through* nodes that fail the filter. They are simply never admitted to the
+result set.
+
+Refusing to traverse them would be the obvious optimisation and it would be a
+serious bug — it disconnects the graph along filter boundaries and reproduces
+exactly the fragmentation failure from Week 2, where search gets stranded in
+whichever region it started in. Non-matching nodes are still the bridges.
+
+The early-termination check is also conditioned on the result set actually being
+full, because under a selective filter it can stay below `ef` for a long stretch
+and the search must keep exploring rather than bail out.
+
+### Known cost
+
+Filter matching is a full metadata scan, **O(N) per query**, on every filtered
+search. Real systems maintain an inverted index (value → set of ids) to make
+this sublinear. This is a known cost, not an oversight. Its impact is **not yet
+measured** — neither benchmark exercises filtering.
 
 ## Benchmarks
 
 Measured on n=1000, dim=32, cosine, `M=16`, `M0=32`, `ef_construction=200`,
 30 queries, Recall@10 against `FlatIndex` as ground truth. Single-threaded
-CPython 3.14 on Windows. These are small-scale numbers — see the caveat below.
+CPython 3.14 on Windows. No filtering in these runs.
 
 ### Uniform random
 
 | ef | Recall@10 | p50 (ms) | QPS |
 |----:|----:|----:|----:|
-| 10 | 1.000 | 1.068 | 839.1 |
-| 25 | 1.000 | 1.605 | 530.9 |
-| 50 | 1.000 | 2.378 | 361.4 |
-| 100 | 1.000 | 3.306 | 267.4 |
-| 200 | 1.000 | 3.859 | 232.5 |
-| 400 | 1.000 | 4.129 | 213.8 |
-| **flat (exact)** | **1.000** | **0.127** | **7046.9** |
+| 10 | 1.000 | 1.351 | 714.9 |
+| 25 | 1.000 | 2.200 | 472.2 |
+| 50 | 1.000 | 2.903 | 282.9 |
+| 100 | 1.000 | 3.620 | 257.5 |
+| 200 | 1.000 | 5.608 | 159.0 |
+| 400 | 1.000 | 5.935 | 152.6 |
+| **flat (exact)** | **1.000** | **0.080** | **11385.8** |
 
 ### Clustered (sigma = 0.05, 10 clusters × 100)
 
 | ef | Recall@10 | p50 (ms) | QPS |
 |----:|----:|----:|----:|
-| 10 | 1.000 | 0.475 | 1694.6 |
-| 25 | 1.000 | 0.498 | 1868.7 |
-| 50 | 1.000 | 0.907 | 1133.4 |
-| 100 | 1.000 | 0.662 | 1267.7 |
-| 200 | 1.000 | 1.295 | 721.3 |
-| 400 | 1.000 | 2.520 | 339.3 |
-| **flat (exact)** | **1.000** | **0.075** | **12431.7** |
+| 10 | 1.000 | 0.511 | 1678.9 |
+| 25 | 1.000 | 0.591 | 1369.1 |
+| 50 | 1.000 | 0.644 | 1142.7 |
+| 100 | 1.000 | 0.799 | 1195.4 |
+| 200 | 1.000 | 1.437 | 608.8 |
+| 400 | 1.000 | 2.568 | 374.1 |
+| **flat (exact)** | **1.000** | **0.072** | **12865.3** |
 
 ### Graph connectivity (clustered, n=1000)
 
@@ -199,48 +372,50 @@ CPython 3.14 on Windows. These are small-scale numbers — see the caveat below.
 | Reachable from entry point | 1000 / 1000 |
 | Connected components | 1 |
 | Layer-0 degree min / mean / max | 8 / 27.9 / 32 |
-| Nodes with < 4 edges | 0 |
+| Nodes with 0 edges / < 4 edges | 0 / 0 |
 | Asymmetric edges | 0 |
 | Duplicate edges | 0 |
 | Cross-cluster edges | 402 / 27874 (1.44%) |
-| Layer sizes | L0: 1000 nodes / 27874 edges · L1: 55 / 760 · L2: 5 / 20 |
+| Layer sizes | L0: 1000 nodes / 27874 edges · L1: 70 / 994 · L2: 7 / 42 |
 
-Layer-0 figures are deterministic across runs. Upper-layer node counts vary run
-to run because level assignment is a random draw and the benchmark does not seed
-it — only the layer-0 numbers above are stable.
+Layer-0 figures are deterministic across runs. Upper-layer node counts vary
+because level assignment is a random draw the benchmark does not seed — only the
+layer-0 numbers are stable.
 
 ### The honest caveat
 
-**Brute force currently beats HNSW at this scale, by roughly 5–100×.** That is
-the expected result, not a defect. At n=1000 the flat index is one
+Two things these tables do **not** show.
+
+**Brute force still beats HNSW at this scale, by roughly 5–100×.** That is the
+expected result, not a defect. At n=1000 the flat index is one
 `(1000, 32) @ (32,)` matrix multiply — a single vectorized C loop over 32k
 floats — while HNSW pays Python interpreter overhead per node visited during
 graph traversal. The graph's asymptotic advantage (O(log n) nodes visited versus
-O(n)) does not pay for that constant factor until the scan itself becomes
-expensive.
+O(n)) does not pay for that constant factor until the scan itself gets expensive.
 
-**Recall@10 is 1.000 at every ef value, on both distributions.** That is not a
-result to be proud of — it means the benchmark is not measuring anything. The
-whole point of an ef parameter is to trade recall against latency, and a column
-of identical 1.000s says n=1000 is too small for approximation error to appear
-at all: the graph search is simply finding the exact answer every time. No
-tradeoff curve exists in this data.
+**Recall@10 is 1.000 at every ef value, on both distributions.** The whole point
+of an `ef` parameter is to trade recall against latency, and a column of
+identical 1.000s means n=1000 is too small for approximation error to appear at
+all — the graph search is finding the exact answer every time. No trade-off
+curve exists in this data. These tables should be read as "this dataset is too
+easy to distinguish the two indexes on quality," not as "HNSW achieves 100%
+recall."
 
-So these tables cannot be read as "HNSW achieves 100% recall." They should be
-read as "this dataset is too easy to distinguish the two indexes on quality."
-The one thing they do establish is that latency now responds to the ef budget,
-which is itself the signature of a fixed graph (see below).
+What they do establish is that latency responds to the `ef` budget, which is
+itself the signature of a healthy graph — see below for what it looks like when
+it doesn't.
 
-The real recall/latency curve gets measured at 100k+ vectors in Week 5, which is
-also where the flat/HNSW crossover should appear. Until then, treat both "HNSW
+Both effects resolve at scale. The real recall/latency curve and the flat/HNSW
+crossover get measured at 100k+ vectors in Week 5. Until then, treat both "HNSW
 is faster" and "HNSW is accurate" as unproven by this repository.
 
-## Debugging notes
+## Engineering notes
 
 The most useful thing this project produced was a graph diagnostic, and the
-reason is that **recall alone did not catch either bug**.
+reason is that **recall never caught either of these bugs**. Both were found by
+asserting on structure, not on output quality.
 
-### Before / after
+### Week 2 — the graph was fragmented
 
 | Metric (clustered, n=1000) | Before | After |
 |---|---:|---:|
@@ -248,15 +423,6 @@ reason is that **recall alone did not catch either bug**.
 | Layer-0 nodes reachable from entry point | 100 / 1000 | **1000 / 1000** |
 | Asymmetric layer-0 edges | 11930 | **0** |
 | Connected components | many | **1** |
-
-**Root cause:** reverse-edge pruning left one-way edges. Search could enter a
-region and never leave, so it was trapped in whichever cluster it started from.
-**Fix:** maintain undirected edges on prune — if B drops A, A drops B.
-
-The full story took two passes, because the first fix was incomplete in a way
-recall could not see.
-
-### Act 1 — recall flat at 0.547
 
 HNSW scored a perfect 1.000 Recall@10 on uniform random vectors but only 0.547
 on clustered data, and it stayed flat across ef = 10 → 400. Latency barely grew
@@ -270,27 +436,22 @@ construction, not tuning.
 
 So I wrote `benchmarks/connectivity.py` to test it directly: BFS from the entry
 point over layer-0 edges, count components, check edge symmetry. It reported
-**only 100 of 1000 nodes reachable** from the entry point, and **11930 layer-0
-edges asymmetric** — about 37% of them.
+**only 100 of 1000 nodes reachable**, and **11930 layer-0 edges asymmetric** —
+about 37% of them.
 
-Root cause: when a new node A connected to neighbor B, the reverse edge B→A was
+Root cause: when a new node A connected to neighbour B, the reverse edge B→A was
 added and then immediately pruned away — A was far, so the diversity heuristic
 dropped it — leaving a one-way edge A→B. Because the first inserted cluster had
-nothing to link outward to, every cross-cluster edge ended up pointing *into* it.
-Search could enter a region and never leave, trapped wherever it started.
+nothing to link outward to, every cross-cluster edge ended up pointing *into*
+it. Search could enter a region and never leave.
 
 Fix: maintain undirected edges. When B drops A during pruning, A also drops B.
 
-### Act 2 — 2398 one-way edges survived the fix
+### Week 3 — the fix was defeated by mutation during iteration
 
-After that fix, recall went to 1.000 everywhere and reachability to 1000/1000 —
-so by every metric I had originally been watching, the bug was closed. The
-connectivity checker disagreed: **2398 of 28776 layer-0 edges were still
-asymmetric.**
-
-The undirected-edge repair was correct in intent and defeated by aliasing. The
-new node's neighbor list was published by reference and then iterated over
-*while the repair mutated it*:
+The undirected-edge repair was correct in intent and undermined by aliasing. The
+new node's neighbour list was published by reference and then iterated *while
+the repair mutated it*:
 
 ```python
 self.neighbors[l][id] = selected   # same list object
@@ -300,37 +461,67 @@ for n_id in selected:              # iterating the live list
         d_list.remove(n_id)        # can remove from `selected` mid-loop
 ```
 
-When neighbor B pruned the new node A away, the repair called `remove()` on A's
-own list — the very list the `for` loop was walking. Removing the current element
-shifts the remainder left by one, so **the next neighbor was silently skipped**
-and never received its reverse edge. The repair for one-way edges was itself
+When neighbour B pruned the new node A away, the repair called `.remove()` on
+A's own list — the very list the `for` loop was walking. Removing the current
+element shifts the remainder left, so **the next neighbour was silently
+skipped** and never received its reverse edge. The repair for one-way edges was
 creating one-way edges.
 
-Fix: iterate a snapshot (`for n_id in list(selected)`). Asymmetric edges went
-2398 → 0, completing the 11930 → 0 progression in the table above. Layer-0 edges
-dropped ~3% (28776 → 27874) as the phantom half-edges disappeared, and mean
-degree settled at 27.9.
+Symptom: `asymmetric edges: 2398` in the connectivity diagnostic, **while every
+existing test passed**. Recall was 1.000. At n=1000 the graph stays dense enough
+(mean degree ~28, single component) that search succeeds despite thousands of
+broken edges, so the suite was structurally blind to it.
 
-### What this cost and what it bought
+Fix: store and iterate a copy of the neighbour list — `list(selected)` in both
+places. Asymmetric edges 2398 → 0.
 
-Recall stayed at 1.000 throughout Act 2 — at n=1000 the graph is dense enough
-(mean degree ~28, single component) that search succeeds *despite* thousands of
-broken edges. A green test suite was actively hiding the defect. The one signal
-that would have exposed it earlier is the one in the tables above: latency that
-does not respond to ef.
+**The regression test was verified to fail, not assumed to.**
+`test_layer0_edges_are_symmetric` builds a 500-vector clustered index and
+asserts every layer-0 edge `A→B` has a matching `B→A`. Run against the reverted
+code it reports **495 of 14,669 layer-0 edges one-way** and fails; against the
+fixed code, 0. It also asserts the graph is non-empty first, so it cannot pass
+vacuously. A regression test nobody has seen fail is a guess.
 
-The lesson I'd carry forward: for a data structure, assert on **structural
-invariants** — symmetry, reachability, degree bounds — not only on end-to-end
-quality metrics. Quality metrics degrade gracefully, which means they hide
-structural damage right up until the scale at which they suddenly don't.
+### The lesson
+
+For a data structure, assert on **structural invariants** — symmetry,
+reachability, degree bounds — not only on end-to-end quality metrics. Quality
+metrics degrade gracefully, which means they hide structural damage right up
+until the scale at which they suddenly don't.
+
+## Known limitations
+
+Stated plainly rather than discovered later.
+
+- **No compaction of tombstones.** Deleted nodes stay in `data` and in the graph
+  forever. Memory never shrinks after a delete, and search does wasted distance
+  work on dead nodes. A delete-heavy workload degrades until restart.
+- **O(N) filter matching.** Every filtered query does a full metadata scan.
+  Real systems keep an inverted index. Impact not yet measured.
+- **No concurrency control.** The index is plain, unsynchronised Python objects
+  with no locking, and FastAPI can interleave requests. **A single uvicorn worker
+  (the default) is required.** Multiple workers would need either a lock or a
+  single-writer process; running them today would corrupt the graph.
+- **Nodes promoted above the current max level get no neighbour entries at those
+  top layers.** Insert only connects from `min(level, max_level)` downward, so a
+  node drawing a level above the current maximum becomes the entry point at
+  layers where it has no adjacency. Harmless in practice — descending through an
+  empty layer just returns the entry point unchanged — but the node is silently
+  absent from layers it was promoted to.
+- **Filtering is exact-match only**, conjunctive across keys. No ranges, no `OR`,
+  no negation.
+- **The flat index is derived state.** Only HNSW is snapshotted; `FlatIndex` is
+  rebuilt from it on boot. Cheap, but it means the two can only ever agree.
+- **Benchmarks are n=1000**, which is too small to demonstrate the properties
+  HNSW exists for. See the caveat above.
 
 ## Roadmap
 
 - [x] **Week 1** — flat index (cosine + L2) and FastAPI CRUD service
 - [x] **Week 2** — HNSW from scratch, Algorithm 4 heuristic, recall validation
       against the flat baseline, ef sweep and connectivity diagnostics
-- [ ] **Week 3** — persistence (snapshot + write-ahead log), metadata filtering,
-      and wiring HNSW through the HTTP API
+- [x] **Week 3** — persistence (snapshot + WAL), metadata filtering with pre/post
+      modes, tombstone deletes, HNSW wired through the API as the default backend
 - [ ] **Week 4** — IVF and Product Quantization
 - [ ] **Week 5** — benchmarking at 100k+ vectors: measure the real recall/latency
       curve across ef, and locate the flat/HNSW crossover
