@@ -629,6 +629,69 @@ reachability, degree bounds — not only on end-to-end quality metrics. Quality
 metrics degrade gracefully, which means they hide structural damage right up
 until the scale at which they suddenly don't.
 
+## Rejected optimisations
+
+Things that looked like wins, were implemented, measured, and thrown away.
+Recording them is the point — a discarded change with a number attached is
+worth more than an untried idea.
+
+### Batching the diversity heuristic: 1.8× slower
+
+Profiling the build showed `_select_neighbors_heuristic` making 81% of all
+distance calls. Batching `_search_layer` had just delivered a large win by
+replacing per-neighbour scalar calls with one vectorised call, so the same
+treatment for the heuristic looked obvious: gather the already-selected
+neighbours' rows and compute the candidate's distance to all of them at once.
+
+It was correct — identical result lists at both ef values, recall delta exactly
+0.0000, connectivity unchanged — and **1.8× slower**:
+
+```
+build: old 11.56s  new 21.21s  speedup 0.55x
+```
+
+The cause, measured on a 3000-vector build rather than guessed:
+
+```
+candidate evaluations            : 2,332,686
+scalar distances actually done   : 5,075,972
+distances a batched call would do: 11,111,428  (2.2x more)
+mean comparisons before exit     : 2.18
+mean len(selected) at that time  : 4.76
+
+  1 comparison(s): 1,189,942  (51.0%)
+  2 comparison(s):   437,596  (18.8%)
+  3 comparison(s):   246,693  (10.6%)
+```
+
+**The early break was doing almost all the work.** The heuristic rejects a
+candidate as soon as it finds one selected neighbour closer than the base, and
+51% of candidates are rejected on the very first comparison — 70% within two.
+The mean is 2.18 comparisons against a `selected` list averaging 4.76 entries.
+
+Batching abandons that exit and must evaluate every entry, so it performs 2.2×
+more arithmetic. Worse, it performs it through a fancy-index gather, a matmul
+and an `.any()` on an array of roughly five rows, where NumPy's per-call
+dispatch overhead dwarfs five scalar dot products. More work, done in a more
+expensive way.
+
+### Why the identical change won in `_search_layer`
+
+The two loops look alike and are not. In `_search_layer` every unvisited
+neighbour must be evaluated regardless — there is no early exit to lose,
+because the heap bookkeeping needs all the distances. The arrays are also about
+6× larger (`M0 = 32` neighbours versus a mean of 4.76 selected). So batching
+there removes up to 32 Python→C round trips and computes exactly the same
+arithmetic it always did.
+
+Batching pays when every element must be computed anyway and the array is large
+enough to amortise dispatch. It loses when a branch was already skipping most of
+the work. The reasoning that justified one change actively misfires on the other.
+
+The original framing of the idea — "up to M scalar calls, so batching should
+win" — is where it went wrong. "Up to M" concealed the distribution, and the
+mean is what the runtime actually cares about.
+
 ## Known limitations
 
 Stated plainly rather than discovered later.
