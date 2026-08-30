@@ -42,6 +42,7 @@ memory.
 import argparse
 import csv
 import gc
+import random
 import time
 import tracemalloc
 from pathlib import Path
@@ -59,6 +60,13 @@ NPROBE_VALUES = (4, 16)
 PQ_M = 8
 PROGRESS_EVERY = 2500
 PROGRESS_THRESHOLD = 10000
+
+# HNSWIndex draws node levels from the stdlib `random`. Left unseeded, every
+# run builds a structurally different graph and recall wanders by a percentage
+# point or more between runs -- which makes two tagged CSVs incomparable and
+# can disguise a real regression as noise (or vice versa). Seeding here is what
+# makes `--tag a` vs `--tag b` an actual controlled comparison.
+BUILD_SEED = 20250830
 
 RESULTS_DIR = Path("benchmarks") / "results"
 
@@ -229,6 +237,10 @@ def measure_size(
 
     # ---------------- HNSW ------------------------------------------------ #
     gc.collect()
+    # Reseed immediately before the build so the level draws are identical
+    # across runs and across tags, independent of how much randomness the flat
+    # and IVF+PQ sections consumed beforehand.
+    random.seed(BUILD_SEED)
     if measure_memory:
         tracemalloc.start()
     start = time.perf_counter()
