@@ -36,5 +36,3 @@ CLAUDE.md
 .cursorrules
 .github/copilot-instructions.md
 *.prompt.md
-# benchmark output
-benchmarks/results/
