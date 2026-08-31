@@ -1,5 +1,7 @@
 # nanovec
 
+![CI](https://github.com/PPaul14/nanovec/actions/workflows/ci.yml/badge.svg)
+
 A persistent, filterable vector database built from scratch in Python: two
 independent approximate indexes — an HNSW graph and an IVF + Product
 Quantization index — plus metadata filtering, tombstone deletes, a write-ahead
@@ -106,6 +108,30 @@ closest node at each level with `ef=1`, then run a wide best-first search at
 layer 0 with the caller's `ef` budget and return the top `k`.
 
 ## Quickstart
+
+### Docker (recommended)
+
+```bash
+git clone https://github.com/PPaul14/nanovec.git
+cd nanovec
+docker compose up --build
+```
+
+Interactive API docs: <http://localhost:8000/docs>
+
+State persists in the `nanovec-data` Docker volume, which survives
+`docker compose down`. Removing it is a deliberate act — `docker compose down -v`.
+
+**Deployment requirement: exactly one worker.** The compose file and Dockerfile
+both pin `--workers 1`, and that is a correctness constraint rather than a
+performance default. The index is plain unsynchronised Python objects held in
+process memory; a second uvicorn worker is a separate OS process with its own
+divergent copy of the graph. Writes to one would be invisible to the other, and
+each would snapshot over the other's state. Raising the worker count does not
+scale nanovec, it corrupts it. Real concurrency would need either a lock plus
+shared memory, or a single dedicated writer process.
+
+### Local Python
 
 ```bash
 git clone https://github.com/PPaul14/nanovec.git
@@ -307,6 +333,77 @@ In test 2 the vector exists only in `data/wal.jsonl` at kill time. Recovery
 replays it on top of whatever snapshot was on disk. The equivalent paths are
 covered automatically by `tests/test_persistence.py`, including the torn-record
 and idempotency cases.
+
+### Durability across a destroyed container
+
+The strongest version of the test: `docker compose down` removes the container
+outright rather than stopping it, so recovery has to come off the volume into a
+process that did not exist when the data was written.
+
+```bash
+docker compose up --build -d
+curl http://localhost:8000/stats          # live_vectors: 0 on a fresh volume
+
+# Insert one vector. Generate the 128 floats rather than typing them.
+python -c "
+import json, random, urllib.request
+random.seed(6)
+body = json.dumps({'id': 'durability-probe',
+                   'vector': [round(random.uniform(-1, 1), 6) for _ in range(128)],
+                   'metadata': {'test': 'week6'}}).encode()
+req = urllib.request.Request('http://localhost:8000/insert', data=body,
+                             headers={'Content-Type': 'application/json'})
+print(urllib.request.urlopen(req).read().decode())
+"
+
+curl -X POST http://localhost:8000/snapshot
+curl http://localhost:8000/stats          # live_vectors: 1, wal_bytes: 0
+
+docker compose down                       # DESTROYS the container
+docker volume ls | grep nanovec-data      # the volume is still there
+
+docker compose up -d                      # a brand new container
+curl http://localhost:8000/stats          # live_vectors: 1
+```
+
+Observed result:
+
+```
+before teardown: {"live_vectors":1,...,"entry_point":"durability-probe","wal_bytes":0}
+container f0f705cf removed, volume vector-db_nanovec-data survived
+after  recreate: {"live_vectors":1,...,"entry_point":"durability-probe","wal_bytes":0}
+```
+
+Searching the new container returns the vector with `score 1.0` and its metadata
+intact, so it is not only the count that survived — the vector data, the
+metadata and the graph entry point all came back off the volume.
+
+`wal_bytes: 0` before teardown is the snapshot having truncated the log, which
+is the ordering described above: the snapshot is durable before the WAL is
+dropped.
+
+## Running the tests / CI
+
+```bash
+pytest tests/ -v                    # 43 tests
+python -m benchmarks.connectivity   # structural diagnostic
+```
+
+[GitHub Actions](.github/workflows/ci.yml) runs on every push and pull request:
+
+- **`test`** — the full suite across Python **3.11, 3.12 and 3.13**, with
+  `fail-fast: false` so one version failing does not cancel the others. Knowing
+  whether a break is version-specific is the reason to run a matrix at all.
+- **`docker`** — builds the image, starts the container, polls `/stats` until it
+  answers (up to 30s), checks `/docs` renders, and tears down with
+  `if: always()` so a failed run cannot leak a container.
+
+The `test` job also runs the **connectivity diagnostic**, and that is the step
+that matters most. Both real bugs in this project were invisible to the test
+suite — the graph was fragmented, then later riddled with one-way edges, and
+recall stayed high enough to pass every assertion both times. Asserting on
+structural invariants in CI means a broken graph fails the build instead of
+waiting to be noticed at a scale where it finally degrades recall.
 
 ## Filtering
 
@@ -739,9 +836,18 @@ Stated plainly rather than discovered later.
 - [x] **Week 4** — IVF + Product Quantization: k-means++ coarse quantizer,
       residual encoding, ADC lookup tables, three-way index comparison, and the
       PQ compression/recall trade-off sweep
-- [ ] **Week 5** — benchmarking at 100k+ vectors: measure the real recall/latency
-      curve across ef, and locate the flat/HNSW crossover
-- [ ] **Week 6** — Docker, architecture diagrams, documentation
+- [x] **Week 5** — scaling benchmark across 1k–10k: located the flat/HNSW
+      crossover, produced the real recall/ef curve, and optimised the distance
+      hot path (2.8× build, crossover 10k → 5k)
+- [x] **Week 6** — packaging and CI: multi-stage Docker image running as a
+      non-root user with a named volume for the index, docker-compose, and a
+      GitHub Actions matrix across Python 3.11–3.13 that also runs the graph
+      connectivity diagnostic
+
+### Future work
+
+- [ ] Scale runs to 100k+ vectors: PQ codebooks are under-trained below ~50k,
+      so IVF+PQ recall figures remain provisional
 
 ## License
 
@@ -755,3 +861,38 @@ MIT — see [LICENSE](LICENSE). Copyright (c) 2026 Priyanshi Paul.
 - Jégou, H., Douze, M., & Schmid, C. (2011). *Product Quantization for Nearest
   Neighbor Search.* IEEE TPAMI, 33(1), 117–128.
   [DOI:10.1109/TPAMI.2010.57](https://doi.org/10.1109/TPAMI.2010.57)
+
+## What I learned
+
+- **Structural invariants catch what quality metrics hide.** Both real bugs here
+  were invisible to the test suite. The graph was fragmented, then later carried
+  thousands of one-way edges, and Recall@10 stayed at 1.000 through both — at
+  this scale the graph is dense enough to return correct answers despite serious
+  structural damage. What found them was asserting on symmetry, reachability and
+  component count. Quality metrics degrade gracefully, which is exactly what
+  makes them poor alarms: they hide the damage until the scale at which they
+  suddenly don't.
+
+- **Measure before optimising, and measure the right thing.** My hypothesis
+  about the slow path was that `_distance` dominated — correct, 91% of build
+  time. My hypothesis about *where it was called from* was wrong: I assumed
+  `_search_layer`, and the profiler said the diversity heuristic made 81% of the
+  calls. Optimising on the guess would have targeted the smaller share. The
+  profile took two minutes and redirected the entire piece of work.
+
+- **A negative result is a result, if you record the number.** Batching the
+  heuristic's inner loop looked like the obvious sequel to a change that had
+  just worked, and it was 1.8× slower. The measurement explained why: an early
+  break was already rejecting 51% of candidates after a single comparison, so
+  batching did 2.2× more arithmetic through a more expensive mechanism. That is
+  written up in [Rejected optimisations](#rejected-optimisations) rather than
+  quietly deleted, because "we tried it and here is the number" is worth more
+  than an untried idea.
+
+- **Brute force wins until it doesn't, and you should know your own crossover.**
+  A flat NumPy scan beat this HNSW implementation up to n=2500, and beat it by
+  9.85× at n=1000. The asymptotically better algorithm loses to one vectorised C
+  loop for a long time, because constants are real. Optimising the hot path
+  moved the crossover from n=10,000 to n=5,000 — the crossover is a property of
+  the implementation, not the algorithm, and the only way to know where it sits
+  is to measure it.
