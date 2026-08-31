@@ -1,0 +1,55 @@
+# Run nanovec:
+#     docker compose up --build
+#
+# This file exists so nobody has to remember the right `docker run` flags. Get
+# the volume flag wrong and the index silently disappears on the next restart,
+# which looks like a bug in the project rather than a mistake in the command.
+
+services:
+  nanovec:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: nanovec:latest
+    container_name: nanovec
+
+    ports:
+      # host:container. The container listens on 0.0.0.0:8000; this publishes it
+      # to http://localhost:8000 on the host.
+      - "8000:8000"
+
+    volumes:
+      # A NAMED volume, not a host bind mount. The container runs as the
+      # non-root `nanovec` user, and a bind mount would be owned by the host UID
+      # -- on Linux that is a permission error on first write unless the host
+      # user's UID happens to match. A named volume is created with the right
+      # ownership and works the same on Linux, macOS and Windows.
+      - nanovec-data:/app/data
+
+    restart: unless-stopped
+
+    # Same check as the Dockerfile: /stats touches the live index, so a 200
+    # means the index recovered, not just that a port is open.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request, sys; sys.exit(0) if urllib.request.urlopen('http://localhost:8000/stats', timeout=4).status == 200 else sys.exit(1)"
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+    # `docker stop` sends SIGTERM, then SIGKILLs after this window. uvicorn
+    # handles SIGTERM by shutting down gracefully, which runs the FastAPI
+    # lifespan handler -- and that takes a final snapshot and truncates the WAL.
+    # Too short a window kills the process mid-snapshot. The default is 10s;
+    # 30s leaves room for a large index to finish writing.
+    stop_grace_period: 30s
+
+volumes:
+  # Declared here so Docker manages its lifecycle. It survives `docker compose
+  # down` -- which is exactly the property the durability test depends on.
+  # Removing it deliberately takes `docker compose down -v`.
+  nanovec-data:

@@ -1,0 +1,106 @@
+# Continuous integration for nanovec.
+#
+# Everything in this project has been verified on one laptop, with one Python
+# version, inside one virtualenv that has accumulated packages over weeks. CI
+# runs the suite on a clean Ubuntu box with a fresh interpreter, which catches
+# the classic failure: a dependency that works locally because it was installed
+# months ago and never made it into requirements.txt.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: tests (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      # Do not cancel the other versions when one fails. Whether a break is
+      # version-specific or universal is the entire reason to run a matrix, and
+      # cancelling siblings throws that information away.
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run tests
+        run: pytest tests/ -v
+
+      # This is the step that matters most, and it is not a test.
+      #
+      # Both real bugs in this project were invisible to the test suite. The
+      # graph was fragmented and later riddled with one-way edges, and recall
+      # stayed high enough to pass every assertion in tests/ both times -- at
+      # this scale the graph is dense enough to return correct answers despite
+      # thousands of broken edges. What caught them was asserting on structural
+      # invariants: reachability, edge symmetry, component count.
+      #
+      # Running the diagnostic here means a structurally broken graph fails the
+      # build, rather than waiting to be noticed at a scale where it finally
+      # degrades recall.
+      - name: Graph connectivity diagnostic
+        run: python -m benchmarks.connectivity
+
+  docker:
+    name: docker build and smoke test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t nanovec:ci .
+
+      - name: Start container
+        run: docker run -d --name nanovec-ci -p 8000:8000 nanovec:ci
+
+      # Poll rather than sleep a fixed amount: the container is ready when it
+      # answers, and /stats only answers once the index has recovered from disk.
+      # A blind `sleep 10` is either wasted time or a flaky failure.
+      - name: Wait for the service to answer
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8000/stats > /dev/null; then
+              echo "service responded after ${i}s"
+              curl -s http://localhost:8000/stats
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "service did not respond within 30s"
+          docker logs nanovec-ci
+          exit 1
+
+      - name: Check the API docs render
+        run: curl -sf -o /dev/null http://localhost:8000/docs
+
+      - name: Container logs
+        if: always()
+        run: docker logs nanovec-ci
+
+      # always() so cleanup runs even when a step above failed. A leaked
+      # container holding port 8000 would wedge the next run on a self-hosted
+      # runner, and leaves no diagnostic value behind once logs are captured.
+      - name: Tear down
+        if: always()
+        run: docker rm -f nanovec-ci

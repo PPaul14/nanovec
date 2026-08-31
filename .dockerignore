@@ -1,0 +1,43 @@
+# Everything here is excluded from the build context -- the tarball the CLI
+# ships to the Docker daemon before the first instruction runs. Excluding is
+# not just about image size: a large context makes the build appear to hang
+# while hundreds of megabytes are copied for nothing.
+
+# The single biggest win. Hundreds of MB of platform-specific binaries that the
+# image must never use anyway -- dependencies are installed fresh in the builder.
+venv/
+.venv/
+
+# Bytecode and test caches: regenerated on demand, and the host's may be for a
+# different Python version than the image's.
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# CRITICAL: the local index (snapshot + WAL). Without this line the developer's
+# current data is baked into the image, so every container everywhere starts
+# with stale vectors instead of an empty volume.
+data/
+
+# Version control and CI config: not needed at runtime, and .git can be large.
+.git/
+.gitignore
+.github/
+
+# Development-time concerns. The service does not run tests or benchmarks, so
+# shipping them makes the image bigger without making it work better. CI runs
+# them from a repo checkout, which is where they belong.
+tests/
+benchmarks/
+
+# Editor and OS noise.
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Documentation. Read on GitHub, not from inside a running container.
+*.md
+LICENSE
