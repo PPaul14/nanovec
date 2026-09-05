@@ -576,6 +576,67 @@ which is why the per-vector ratio is reported separately from the headline
 number: folding a constant into a single ratio would flatter the result at 1k
 and understate it at 1M.
 
+### Scaling to 100k
+
+dim=64, 100 queries, k=10, cosine, seeded. IVF+PQ at `m=8` with `nlist=√N`.
+Recall@10 against `FlatIndex` as ground truth.
+
+| N | index | param | recall | p50 ms | p99 ms | QPS | build s | mem MB |
+|---:|---|---|---:|---:|---:|---:|---:|---:|
+| 10000 | flat | exact | 1.000 | 2.509 | 3.064 | 391.5 | 0.01 | 2.44 |
+| 10000 | hnsw | ef=25 | 0.940 | 1.176 | 1.946 | 823.9 | 44.87 | 4.58 |
+| 10000 | hnsw | ef=100 | 0.940 | 1.325 | 2.176 | 733.6 | 44.87 | 4.58 |
+| 10000 | ivfpq | nprobe=4 | 0.522 | 0.809 | 1.358 | 1174.9 | 6.82 | 0.16 |
+| 10000 | ivfpq | nprobe=16 | 0.522 | 2.962 | 4.643 | 326.7 | 6.82 | 0.16 |
+| 25000 | flat | exact | 1.000 | 5.089 | 6.210 | 194.2 | 0.03 | 6.10 |
+| 25000 | hnsw | ef=25 | 0.950 | 5.375 | 8.417 | 176.6 | 199.68 | 11.32 |
+| 25000 | hnsw | ef=100 | 0.951 | 5.126 | 9.645 | 172.3 | 199.68 | 11.32 |
+| 25000 | ivfpq | nprobe=4 | 0.443 | 1.547 | 3.303 | 595.0 | 22.40 | 0.29 |
+| 25000 | ivfpq | nprobe=16 | 0.443 | 4.918 | 11.034 | 184.5 | 22.40 | 0.29 |
+| 50000 | flat | exact | 1.000 | 17.598 | 30.558 | 53.7 | 0.11 | 12.21 |
+| 50000 | hnsw | ef=25 | 0.969 | 6.487 | 9.827 | 155.0 | 510.60 | 22.57 |
+| 50000 | hnsw | ef=100 | 0.973 | 7.283 | 10.245 | 134.9 | 510.60 | 22.57 |
+| 50000 | ivfpq | nprobe=4 | 0.406 | 1.143 | 2.252 | 806.4 | 33.65 | 0.50 |
+| 50000 | ivfpq | nprobe=16 | 0.416 | 4.418 | 14.083 | 202.9 | 33.65 | 0.50 |
+| 100000 | flat | exact | 1.000 | 19.922 | 31.519 | 49.2 | **0.19** | 24.41 |
+| 100000 | hnsw | ef=25 | 0.930 | 12.416 | 18.044 | 77.1 | 977.05 | 45.00 |
+| 100000 | hnsw | ef=100 | 0.948 | 13.703 | 20.860 | 69.6 | 977.05 | 45.00 |
+| 100000 | ivfpq | nprobe=4 | 0.360 | 1.782 | 3.784 | 547.8 | 75.76 | 0.90 |
+| 100000 | ivfpq | nprobe=16 | 0.372 | 5.766 | 10.339 | 157.6 | 75.76 | 0.90 |
+
+Raw data: `benchmarks/results/scaling_scale100k_clean.csv`.
+
+The **flat build column** is the quadratic insert fix landing at scale: 683s
+before, 0.19s after. See
+[Week 7 — a quadratic insert hiding in one line](#week-7--a-quadratic-insert-hiding-in-one-line).
+
+**On trusting this run.** An earlier 100k attempt was unusable — adjacent
+2,500-insert chunks took 26s and then 5,169s, a 200× swing no algorithm
+produces. This run was made on AC power with sleep disabled; across 66 chunk
+intervals the worst adjacent swing was **2.06×**, with none above 3×. The
+n=10,000 row is a deliberate overlap with an earlier seeded run and matches it
+to **0.04%** on HNSW build time (44.854s vs 44.87s), with recall identical.
+
+### The crossover, and where flat still wins
+
+| N | flat p50 | HNSW ef=100 p50 | winner |
+|---:|---:|---:|---|
+| 10000 | 2.509 | 1.325 | HNSW 1.89× |
+| 25000 | 5.089 | 5.126 | tie (flat 1.01×) |
+| 50000 | 17.598 | 7.283 | HNSW 2.42× |
+| 100000 | 19.922 | 13.703 | HNSW 1.45× |
+
+The crossover stays at **n≈5000**, where Week 5 put it. That is the expected
+result: the insert fix made flat much cheaper to *build* and did not touch its
+query path at all, so there was no reason for the query crossover to move.
+
+The flat series is roughly linear with real measurement scatter. Extrapolating
+from 10k, linear would predict 6.27ms at 25k (measured 5.089), 12.5ms at 50k
+(measured 17.6) and 25.1ms at 100k (measured 19.9) — it lands under, over and
+under again. **The 50k p50 looks like an outlier**: it also carries the widest
+p50/p99 spread in the table, 17.6 against 30.6. Reported as observed; we have
+not isolated a mechanism for it and are not going to invent one.
+
 ### What limits IVF+PQ recall
 
 This is the most interesting Week 4 result, and it is not the one the table
@@ -605,12 +666,51 @@ to choose IVF+PQ over HNSW in the first place. There is no setting here that is
 simply "better"; there is a frontier, and picking a point on it is an
 application decision about how much memory a percentage of recall is worth.
 
-**These numbers are provisional.** The codebooks are under-trained at this
-scale: 2000 training vectors across 8 subspaces against 256 centroids each is
-roughly **8 training points per centroid**. FAISS wants orders of magnitude more
-for `ksub=256`. Expect all of these recall figures to improve at the Week 5
-scale-up, and treat the shape of the curve as more trustworthy than its absolute
-height.
+### Correction: recall does not improve at scale
+
+This README previously said the n=2000 figures were held down by under-trained
+codebooks — 2000 training vectors across 8 subspaces against 256 centroids each
+is roughly 8 training points per centroid, far below what FAISS wants for
+`ksub=256` — and predicted that **all these recall figures would improve at the
+Week 5 scale-up**.
+
+**That prediction was wrong. The measurement showed the opposite.**
+
+| N | nprobe=4 | nprobe=16 |
+|---:|---:|---:|
+| 10000 | 0.522 | 0.522 |
+| 25000 | 0.443 | 0.443 |
+| 50000 | 0.406 | 0.416 |
+| 100000 | **0.360** | **0.372** |
+
+A 31% relative decline from 10k to 100k, monotonic, with no inflection. Both
+runs were seeded and the figures reproduced exactly at 10k, 25k and 50k across
+two separate runs, so this is not noise.
+
+The mechanism: **`ksub=256` is fixed regardless of N.** As more vectors spread
+through the same space, each of the 256 codebook entries per subspace has to
+represent proportionally more of it, so reconstruction gets coarser. More
+training data does improve how well each centroid *fits* the points assigned to
+it, but it cannot offset the growing volume each centroid must stand for. The
+training-data argument was real and simply not the dominant term.
+
+`nlist` scales as √N (100 → 158 → 223 → 316), so the coarse quantizer kept pace
+with the data while recall fell anyway — consistent with the finding above that
+PQ error, not cell coverage, is the binding constraint.
+
+**One confound, stated plainly.** This benchmark's cluster count is capped at 50
+for any N ≥ 1000, so vectors-per-cluster grows from 200 at 10k to 2,000 at 100k
+at the same `sigma` — ten times denser, with far more near-equidistant
+competitors for each top-10 slot. The task genuinely gets harder as N rises, so
+the honest claim is that **recall declines as N grows under this benchmark's
+clustering, most likely dominated by fixed codebook capacity** — not that the
+codebook effect has been isolated from the density effect. The correction to the
+old "larger N will help" claim stands either way: recall fell, and it was
+predicted to rise.
+
+**The fix is more bits, not more data.** Raising `m` or `nbits` is what buys
+recall back, at the cost of the compression that justifies IVF+PQ in the first
+place — the same frontier as the table above.
 
 **On k-means++:** switching the coarse quantizer from random to k-means++
 seeding measurably improved it — visible at `nprobe=1`, where better-spread
@@ -642,9 +742,25 @@ What they do establish is that latency responds to the `ef` budget, which is
 itself the signature of a healthy graph — see below for what it looks like when
 it doesn't.
 
-Both effects resolve at scale. The real recall/latency curve and the flat/HNSW
-crossover get measured at 100k+ vectors in Week 5. Until then, treat both "HNSW
-is faster" and "HNSW is accurate" as unproven by this repository.
+Both of those were measured at scale in Week 7, and the answers are above: the
+crossover sits at n≈5000, and `ef` does eventually matter.
+
+**Does `ef` separate recall?** Only at 100k, and only just:
+
+| N | ef=25 | ef=100 | gap |
+|---:|---:|---:|---:|
+| 10000 | 0.940 | 0.940 | 0.000 |
+| 25000 | 0.950 | 0.951 | 0.001 |
+| 50000 | 0.969 | 0.973 | 0.004 |
+| **100000** | **0.930** | **0.948** | **0.018** |
+
+The gap widens monotonically and reaches 1.8 points at 100k, 4.5× the 50k
+separation. So the knob finally does visible work. Two caveats keep that from
+being a clean win. The gap is 18 hits out of 1000 — real, but a small sample.
+And **absolute recall fell** from 0.969/0.973 at 50k to 0.930/0.948 at 100k:
+the separation came from `ef=25` degrading faster, not from `ef=100` improving.
+Part of that drop is the benchmark's own cluster density rising with N (see
+[Known limitations](#known-limitations)), not the index getting worse.
 
 ## Engineering notes
 
@@ -718,6 +834,68 @@ asserts every layer-0 edge `A→B` has a matching `B→A`. Run against the rever
 code it reports **495 of 14,669 layer-0 edges one-way** and fails; against the
 fixed code, 0. It also asserts the graph is non-empty first, so it cannot pass
 vacuously. A regression test nobody has seen fail is a guess.
+
+### Week 7 — a quadratic insert hiding in one line
+
+The first two bugs were in the HNSW graph, the hard part of the project. This
+one was in `FlatIndex`, the simplest file in the repo, and it had been there
+since Week 1 passing every test.
+
+It was invisible until scale. The 100k run showed `FlatIndex` taking **683s** to
+load 100,000 vectors against **2.7s** for 10,000 — roughly 250× the time for 10×
+the data. Nothing about a brute-force index should behave that way: the
+per-vector work is a single array write.
+
+The cause was one line in `insert`:
+
+```python
+self.vectors = np.vstack([self.vectors, vec])
+```
+
+`vstack` allocates a new array and copies every existing row. Inserting N
+vectors therefore copies about **N²/2 rows** in total. It reads like an append
+and behaves like a full reallocation.
+
+The fix is capacity doubling — a backing array with spare room, a `_count` of
+live rows, and a doubling grow when it fills, so copies get geometrically rarer
+and the cost amortises to O(1) per insert. It is what `list.append` does
+internally, and what `HNSWIndex` was already doing since Week 5.
+
+| N | before | after | speedup |
+|---:|---:|---:|---:|
+| 1000 | 0.022s | 0.002s | 11× |
+| 2000 | 0.069s | 0.005s | 14× |
+| 4000 | 0.816s | 0.008s | 102× |
+| 8000 | 6.053s | 0.016s | 378× |
+| 16000 | 26.333s | 0.031s | **849×** |
+
+Fitted exponent **2.56 → 1.02**: quadratic to linear. At 100k in the scaling
+benchmark the flat build went **683s → 0.19s**. `benchmarks/insert_scaling.py`
+reproduces this, and the `µs/insert` column is the clearest read — flat for an
+amortised O(1) append, rising with N for a quadratic one.
+
+**Why a timing table caught what reading the code did not.** `np.vstack` is
+idiomatic NumPy and looks like the obvious way to append a row. Nothing about
+the line is wrong in isolation; it is wrong *in a loop*, and that only shows up
+as a shape in a table of timings across N. Doubling N should double the time.
+When each doubling quadruples it instead, the structure of the cost is the
+signal — no amount of reading the function would have produced that number.
+
+**Verified against the previous implementation**, same seed and same data: ids
+and stored vectors bit-identical, 100/100 identical result lists for both
+cosine and L2, and a max score delta of exactly `0.000e+00` — not float epsilon,
+zero. This index is the ground truth every recall figure in this README is
+measured against, so "probably the same" was not good enough.
+
+For the same reason `delete` is deliberately **not** swap-with-last. That would
+make it O(1) instead of O(N), but it reorders the backing rows, and `search`
+resolves ties by whatever order `np.argsort` sees — two identically-scored
+vectors could come back in a different order than before. The reallocation is
+gone regardless: rows now shift inside the existing buffer rather than
+`np.delete` building a new array each time.
+
+`insert_many` was added alongside it for bulk loads: one capacity grow and one
+block copy instead of N Python calls, a further 2.6–4.6× over the fixed loop.
 
 ### The lesson
 
@@ -819,12 +997,26 @@ Stated plainly rather than discovered later.
   tests and benchmarks, not over HTTP.
 - **IVF+PQ supports only `nbits=8`** (256-entry codebooks). Other codebook sizes
   are rejected at construction.
-- **PQ codebooks are under-trained at benchmark scale** — roughly 8 training
-  points per centroid. Recall figures for IVF+PQ are provisional until Week 5.
+- **IVF+PQ recall is bounded by codebook resolution, not training volume.**
+  `ksub=256` is fixed, so each codebook entry covers proportionally more of the
+  space as N grows and recall falls with scale rather than rising: 0.522 at 10k
+  down to 0.360 at 100k. Recovering it means raising `m` or `nbits` and giving
+  up compression.
+- **The scaling benchmark does not hold cluster density constant, though it
+  intends to.** `build_clustered` computes
+  `n_clusters = max(10, min(50, n // 20))`, and that cap binds for every
+  N ≥ 1000 — so the cluster count is stuck at 50 while vectors-per-cluster grows
+  from 200 at 10k to 2,000 at 100k, all at the same `sigma`. Denser clusters
+  mean more near-equidistant competitors for each top-10 slot, so the task gets
+  harder as N rises. **Every recall-vs-N comparison in this README is therefore
+  indicative rather than controlled**: the HNSW drop from 0.969 at 50k to 0.930
+  at 100k, and the IVF+PQ decline, both mix index behaviour with a moving
+  target. Fixing it means scaling `n_clusters` with N and re-running the sweep.
 - **Neither IVF+PQ nor its state is persisted.** The WAL and snapshot layer
   covers HNSW only.
-- **Benchmarks are n=1000 and n=2000**, too small to demonstrate the properties
-  either approximate index exists for. See the caveats above.
+- **The n=1000 and n=2000 tables** above are too small to demonstrate the
+  properties either approximate index exists for; they are kept as small-scale
+  diagnostics. The 10k–100k table is the one to read for scaling behaviour.
 
 ## Roadmap
 
@@ -846,8 +1038,16 @@ Stated plainly rather than discovered later.
 
 ### Future work
 
-- [ ] Scale runs to 100k+ vectors: PQ codebooks are under-trained below ~50k,
-      so IVF+PQ recall figures remain provisional
+- [x] **Scale runs to 100k+ vectors** — done in Week 7. It also found a
+      quadratic insert in `FlatIndex` and falsified the expectation that IVF+PQ
+      recall would improve with N.
+- [ ] **Hold cluster density constant across N** in the scaling harness, so
+      recall-vs-N is a controlled comparison rather than an indicative one
+- [ ] **Raise `m` / `nbits` to recover IVF+PQ recall**, and measure where the
+      compression-versus-recall frontier actually sits at 100k
+- [ ] **HNSW build cost is the barrier to 1M** — 977s at 100k, growing at
+      roughly N^1.2. Batched construction or dropping the hot loop into native
+      code is the next real step
 
 ## License
 
@@ -888,6 +1088,16 @@ MIT — see [LICENSE](LICENSE). Copyright (c) 2026 Priyanshi Paul.
   written up in [Rejected optimisations](#rejected-optimisations) rather than
   quietly deleted, because "we tried it and here is the number" is worth more
   than an untried idea.
+
+- **Scale is a diagnostic, not just a workload.** The worst bug in this project
+  was a `np.vstack` inside a loop, in the simplest file in the repo, present
+  since Week 1 and passing every test. Reading the line teaches you nothing — it
+  is idiomatic NumPy and looks like an append. What exposed it was a table of
+  timings across N: doubling the data should double the time, and instead it
+  quadrupled. The shape of a cost curve says things no amount of staring at the
+  function will. The same run also falsified a prediction I had written into
+  this README, which is the other half of the lesson — measurement is worth most
+  when it can tell you that you were wrong.
 
 - **Brute force wins until it doesn't, and you should know your own crossover.**
   A flat NumPy scan beat this HNSW implementation up to n=2500, and beat it by
