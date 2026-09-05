@@ -63,7 +63,7 @@ async def lifespan(app: FastAPI):
     state["wal"].truncate()
 
 
-app = FastAPI(title="nanovec", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="nanovec", version="1.0.0", lifespan=lifespan)
 
 
 @app.post("/insert", response_model=OkResponse)

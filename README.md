@@ -1035,12 +1035,13 @@ Stated plainly rather than discovered later.
       non-root user with a named volume for the index, docker-compose, and a
       GitHub Actions matrix across Python 3.11–3.13 that also runs the graph
       connectivity diagnostic
+- [x] **Week 7** — fixed a quadratic insert in `FlatIndex` (683s → 0.19s at
+      100k), added bulk insert, and re-ran the scaling benchmark cleanly to
+      100k. The run also falsified this README's expectation that IVF+PQ recall
+      would improve with N.
 
 ### Future work
 
-- [x] **Scale runs to 100k+ vectors** — done in Week 7. It also found a
-      quadratic insert in `FlatIndex` and falsified the expectation that IVF+PQ
-      recall would improve with N.
 - [ ] **Hold cluster density constant across N** in the scaling harness, so
       recall-vs-N is a controlled comparison rather than an indicative one
 - [ ] **Raise `m` / `nbits` to recover IVF+PQ recall**, and measure where the
