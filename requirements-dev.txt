@@ -1,0 +1,16 @@
+# Development-only dependencies.
+#
+# Deliberately NOT in requirements.txt. The Dockerfile installs only the runtime
+# requirements, and matplotlib pulls in pillow, fonttools, kiwisolver and
+# contourpy -- tens of megabytes of image and font machinery that a vector
+# search service never executes. Charts are generated on a developer machine and
+# the resulting PNGs are committed, so the image has no reason to carry the
+# library that drew them.
+#
+# Install with:
+#     venv/Scripts/python.exe -m pip install -r requirements-dev.txt
+
+-r requirements.txt
+
+# Chart rendering for benchmarks/plot_results.py
+matplotlib

@@ -604,7 +604,33 @@ Recall@10 against `FlatIndex` as ground truth.
 | 100000 | ivfpq | nprobe=4 | 0.360 | 1.782 | 3.784 | 547.8 | 75.76 | 0.90 |
 | 100000 | ivfpq | nprobe=16 | 0.372 | 5.766 | 10.339 | 157.6 | 75.76 | 0.90 |
 
-Raw data: `benchmarks/results/scaling_scale100k_clean.csv`.
+Raw data: `benchmarks/results/scaling_scale100k_clean.csv`. The charts below are
+rendered from that same CSV by `benchmarks/plot_results.py` — nothing in them is
+hand-entered, so re-running the benchmark and re-running the script keeps the
+tables and the pictures in agreement. The tables are the precise numbers; the
+charts are the shape.
+
+![Query latency vs index size](benchmarks/results/crossover.png)
+
+Brute force is not the slow option until it suddenly is. Flat and HNSW trade
+places around 25k, then flat's linear scan pulls away while the graph keeps its
+cost roughly flat. IVF+PQ is fastest throughout — it scans a fraction of the
+data and compares compressed codes — which is only worth having alongside the
+recall chart below.
+
+![Recall@10 vs index size](benchmarks/results/recall_vs_n.png)
+
+The same three indexes, priced in accuracy. HNSW holds 0.93–0.97 across the
+range; IVF+PQ starts at 0.52 and falls to 0.36. Read together with the latency
+chart, this is the actual trade: IVF+PQ's speed is bought with recall, and at
+this scale it is buying rather a lot of it.
+
+![Index memory vs index size](benchmarks/results/memory.png)
+
+And the reason IVF+PQ exists at all. At 100k it holds 0.9 MB against HNSW's
+45 MB — 50× less — and the gap widens with N. Memory is the axis on which it
+wins, which is why the three charts have to be read as a set rather than
+individually.
 
 The **flat build column** is the quadratic insert fix landing at scale: 683s
 before, 0.19s after. See
